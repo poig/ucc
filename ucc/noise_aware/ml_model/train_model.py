@@ -454,6 +454,19 @@ def physical_dag_to_graph(
 # ==============================================================================
 # 2. DATASET CLASS (Copied directly into this file)
 # ==============================================================================
+def load_and_deserialize_data(path):
+    print(f"Loading and deserializing dataset from: {path}")
+    with open(path, "r") as f:
+        # For now, we assume the json contains a placeholder for the DAG
+        # In a real scenario, you'd use qiskit.qpy to load circuits
+        raw_data = json.load(f)
+        # THIS IS A CRITICAL STEP YOU MUST IMPLEMENT
+        # For now, we'll crash if the data is not in the right format
+        for item in raw_data:
+            if "dag" not in item:
+                raise KeyError("Dataset entry is missing 'dag' key.")
+            # You would have a function here like: item['dag'] = dag_from_your_format(item['dag'])
+    return raw_data
 
 
 class FidelityDataset(Dataset):
@@ -729,21 +742,25 @@ if __name__ == "__main__":
 
     # --- Load Data ---
     print(f"Loading dataset from: {args.dataset_path}")
-    with open(args.dataset_path, "r") as f:
-        raw_data = json.load(f)
+    raw_data = load_and_deserialize_data(args.dataset_path)
+    # with open(args.dataset_path, "r") as f:
+    #     raw_data = json.load(f)
 
     # 2. Create the appropriate dataset instance
     #    The FidelityDataset is now smart enough to handle both cases.
     print(f"Preparing data for '{args.model}' model...")
     target = FakeWashingtonV2()
-    noise_profile = DeviceNoiseProfile(get_target(target))
+    noise_profile = DeviceNoiseProfile(target)
+
+    GATE_VOCAB = ["cx", "sx", "rz", "x", "id", "measure", "other"]
+
     full_dataset = FidelityDataset(
         raw_data=raw_data,
         noise_profile=noise_profile,
         model_type=args.model,
         max_seq_len=args.max_seq_len,
         feature_dim=args.feature_dim,
-        # You can pass other feature config args here if needed
+        gate_vocab=GATE_VOCAB,
     )
 
     # 3. Split the dataset into training and validation sets
@@ -813,7 +830,7 @@ if __name__ == "__main__":
 
     criterion = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
-    scaler = torch.cuda.amp.GradScaler(
+    scaler = torch.amp.GradScaler(
         enabled=(device.type == "cuda")
     )  # Mixed precision scaler
 
@@ -832,25 +849,31 @@ if __name__ == "__main__":
             leave=False,
         )
 
-        for features, labels in train_pbar:
-            features, labels = (
-                features.to(device, non_blocking=True),
-                labels.to(device, non_blocking=True),
-            )
+        for batch in train_pbar:
+            optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast(
                 device_type=device.type,
                 dtype=torch.float16,
                 enabled=(device.type == "cuda"),
             ):
-                outputs = model(features)
+                if args.model == "transformer":
+                    features, labels = batch
+                    features, labels = (
+                        features.to(device, non_blocking=True),
+                        labels.to(device, non_blocking=True),
+                    )
+                    outputs = model(features)
+                elif args.model == "gnn":
+                    batch_data = batch.to(device)
+                    labels = batch_data.y
+                    outputs = model(batch_data)
+
                 loss = criterion(outputs, labels)
 
-            optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-
             total_train_loss += loss.item()
             train_pbar.set_postfix(loss=f"{loss.item():.6f}")
 
@@ -860,17 +883,24 @@ if __name__ == "__main__":
         model.eval()
         total_val_loss = 0.0
         with torch.no_grad():
-            for features, labels in val_loader:
-                features, labels = (
-                    features.to(device, non_blocking=True),
-                    labels.to(device, non_blocking=True),
-                )
+            for batch in val_loader:
                 with torch.amp.autocast(
                     device_type=device.type,
                     dtype=torch.float16,
                     enabled=(device.type == "cuda"),
                 ):
-                    outputs = model(features)
+                    if args.model == "transformer":
+                        features, labels = batch
+                        features, labels = (
+                            features.to(device, non_blocking=True),
+                            labels.to(device, non_blocking=True),
+                        )
+                        outputs = model(features)
+                    else:  # GNN case
+                        batch_data = batch.to(device)
+                        labels = batch_data.y
+                        outputs = model(batch_data)
+
                     loss = criterion(outputs, labels)
                 total_val_loss += loss.item()
 

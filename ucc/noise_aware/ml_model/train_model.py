@@ -16,7 +16,7 @@ from torch_geometric.data import Data
 from torch_geometric.nn import SAGEConv, global_mean_pool
 from qiskit_ibm_runtime.fake_provider import FakeWashingtonV2
 from torch_geometric.loader import DataLoader as GeometricDataLoader
-
+from neuralop.models import FNO
 
 from qiskit.transpiler import Target
 from qiskit.providers import Backend, BackendV2
@@ -451,194 +451,200 @@ def physical_dag_to_graph(
     return Data(x=x, edge_index=edge_index)
 
 
-# ==============================================================================
-# 2. DATASET CLASS (Copied directly into this file)
-# ==============================================================================
-def load_and_deserialize_data(path):
-    print(f"Loading and deserializing dataset from: {path}")
-    with open(path, "r") as f:
-        # For now, we assume the json contains a placeholder for the DAG
-        # In a real scenario, you'd use qiskit.qpy to load circuits
-        raw_data = json.load(f)
-        # THIS IS A CRITICAL STEP YOU MUST IMPLEMENT
-        # For now, we'll crash if the data is not in the right format
-        for item in raw_data:
-            if "dag" not in item:
-                raise KeyError("Dataset entry is missing 'dag' key.")
-            # You would have a function here like: item['dag'] = dag_from_your_format(item['dag'])
-    return raw_data
-
-
-class FidelityDataset(Dataset):
+class CircuitCNN(nn.Module):
     """
-    A flexible PyTorch Dataset that can generate data for either a Transformer
-    or a Graph Neural Network model.
-
-    It can operate in two modes:
-    1. On-the-fly processing: If `raw_data` is provided, it converts DAGs
-       to features with every __getitem__ call (slower).
-    2. Pre-processed loading: If `preprocessed_path` is provided, it loads
-       a pre-saved list of processed data objects (much faster).
+    An efficient 1D Convolutional Neural Network to predict quantum circuit fidelity.
+    Designed for high-speed inference.
     """
 
     def __init__(
         self,
-        model_type: str,
-        # --- Data Sources (provide ONE of these) ---
-        raw_data=None,
-        preprocessed_path: str = None,
-        # --- Config for On-the-fly Processing ---
-        noise_profile=None,
-        max_seq_len: int = 1024,
-        feature_dim: int = 16,
-        gate_vocab: list = None,
-        # ... other feature config ...
+        feature_dim: int,  # Dimensionality of the input feature vector (e.g., 16)
+        model_dim: int,  # Number of channels in the CNN layers (e.g., 64 or 128)
+        n_layers: int,  # Number of convolutional blocks (e.g., 3 or 4)
+        kernel_size: int = 3,  # Size of the sliding window (3 is a great default)
+        dropout: float = 0.1,
     ):
-        if model_type not in ["transformer", "gnn"]:
-            raise ValueError(
-                "model_type must be either 'transformer' or 'gnn'"
-            )
+        super().__init__()
 
-        if raw_data is None and preprocessed_path is None:
-            raise ValueError(
-                "Must provide either 'raw_data' or 'preprocessed_path'"
-            )
+        # The CNN expects input of shape [batch, channels, length].
+        # Our data is [batch, length, channels], so we will permute it.
 
-        if raw_data is not None and preprocessed_path is not None:
-            print(
-                "Warning: Both raw_data and preprocessed_path provided. Using pre-processed data."
-            )
+        self.conv_layers = nn.ModuleList()
+        # The first layer projects the input feature_dim to the model_dim
+        in_channels = feature_dim
+        out_channels = model_dim
 
+        for i in range(n_layers):
+            # Each block consists of a convolution, activation, and dropout
+            conv_block = nn.Sequential(
+                nn.Conv1d(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    padding="same",  # 'same' padding keeps the sequence length constant
+                ),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+            self.conv_layers.append(conv_block)
+            # The input channels for the next layer is the output of this one
+            in_channels = out_channels
+
+        # The classifier head takes the flattened output of the CNN
+        # The input size to the linear layer depends on the final number of channels
+        # and the sequence length after pooling.
+        self.classifier_head = nn.Sequential(
+            nn.Linear(model_dim, model_dim // 2),
+            nn.ReLU(),
+            nn.Linear(model_dim // 2, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, src: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            src: Tensor, shape [batch_size, seq_len, feature_dim]
+        """
+        # Permute the input to match Conv1d's expected shape: [batch, channels, length]
+        x = src.permute(0, 2, 1)
+
+        # Pass through the convolutional layers
+        for conv_block in self.conv_layers:
+            x = conv_block(x)
+
+        # Global Average Pooling: Take the mean across the entire sequence length dimension.
+        # This creates a single feature vector for the whole circuit.
+        # Input x has shape [batch, model_dim, seq_len]
+        # Output x_pooled has shape [batch, model_dim]
+        x_pooled = F.adaptive_avg_pool1d(x, 1).squeeze(-1)
+
+        # Pass the final feature vector through the classifier
+        prediction = self.classifier_head(x_pooled)
+
+        return prediction
+
+
+class CircuitFNO(nn.Module):
+    """
+    A 1D Fourier Neural Operator model to predict quantum circuit fidelity.
+    This model learns in the frequency domain, which is a natural fit for
+    wave-like quantum dynamics.
+    """
+
+    def __init__(
+        self,
+        feature_dim: int,  # Input dimension (e.g., 16)
+        n_modes: int,  # Number of Fourier modes to keep. This is the key hyperparameter.
+        hidden_channels: int,  # The "width" of the FNO layers
+        n_layers: int,  # Number of FNO blocks
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        # The FNO1D model from the neuraloperator library does all the hard work.
+        self.fno = FNO(
+            n_modes=(n_modes,),  # Must be a tuple for 1D data
+            hidden_channels=hidden_channels,
+            in_channels=feature_dim,
+            out_channels=1,  # We want to directly output a single value (logit)
+            n_layers=n_layers,
+            use_mlp=True,  # Adds a small MLP after the spectral convolution
+            mlp_dropout=dropout,
+        )
+
+    def forward(self, src: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            src: Tensor, shape [batch_size, seq_len, feature_dim]
+        """
+        # FNO expects input of shape [batch, channels, length]
+        x = src.permute(0, 2, 1)
+
+        # Pass through the FNO layers
+        x = self.fno(x)
+
+        # The FNO output is [batch, 1, seq_len]. We need to pool it.
+        # Global Average Pooling to get a single value for the circuit.
+        x_pooled = torch.mean(x, dim=2)  # Shape: [batch, 1]
+
+        # Apply the final Sigmoid activation to get a probability
+        prediction = torch.sigmoid(x_pooled)
+
+        return prediction
+
+
+# ==============================================================================
+# 2. DATASET CLASS (Copied directly into this file)
+# ==============================================================================
+class FidelityDataset(Dataset):
+    """
+    A flexible PyTorch Dataset that works with pre-computed feature tensors.
+    It can generate data for either a Transformer or a Graph Neural Network model
+    from the SAME input data source.
+    """
+
+    def __init__(
+        self,
+        raw_data,  # List of {'feature_tensor': [...], 'fidelity_label': ...}
+        model_type: str,  # Either "transformer" or "gnn"
+        max_seq_len: int,  # Required for Transformer padding
+        feature_dim: int,  # The dimension of the feature vectors
+    ):
+        self.data = raw_data
         self.model_type = model_type
-
-        # --- THE NEW LOGIC ---
-        if preprocessed_path and os.path.exists(preprocessed_path):
-            print(f"Loading pre-processed data from: {preprocessed_path}")
-            self.data = torch.load(preprocessed_path)
-            self.is_preprocessed = True
-        else:
-            print("Processing raw data on-the-fly.")
-            if raw_data is None:
-                raise FileNotFoundError(
-                    f"Pre-processed file not found at: {preprocessed_path}"
-                )
-            self.data = raw_data
-            self.is_preprocessed = False
-            # Store config needed for on-the-fly processing
-            self.noise_profile = noise_profile
-            self.max_len = max_seq_len
-            self.feature_dim = feature_dim
-            self.gate_vocab = gate_vocab or [
-                "cx",
-                "sx",
-                "rz",
-                "x",
-                "id",
-                "measure",
-                "other",
-            ]
-            # ... store other feature configs ...
+        self.max_len = max_seq_len
+        self.feature_dim = feature_dim
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         item = self.data[idx]
+        feature_sequence = item["feature_tensor"]
+        fidelity_label = torch.tensor(
+            [item["fidelity_label"]], dtype=torch.float32
+        )
 
-        if self.is_preprocessed:
-            final_data = item["data"]
-            fidelity_label = item["fidelity_label"]
-        else:
-            dag = item["dag"]
-            fidelity_label = torch.tensor(
-                [item["fidelity_label"]], dtype=torch.float32
-            )
+        if (
+            self.model_type == "transformer"
+            or self.model_type == "cnn"
+            or self.model_type == "fno"
+        ):
+            # --- Generate padded tensor for the Transformer ---
 
-            if self.model_type == "transformer":
-                feature_sequence = self._dag_to_feature_sequence(dag)
-                # Padding & Truncation
-                if len(feature_sequence) > self.max_len:
-                    feature_sequence = feature_sequence[: self.max_len]
-                padding_needed = self.max_len - len(feature_sequence)
-                if padding_needed > 0:
-                    zero_vector = [0.0] * self.feature_dim
-                    feature_sequence.extend([zero_vector] * padding_needed)
-                final_data = torch.tensor(
-                    feature_sequence, dtype=torch.float32
-                )
+            # 1. Truncate if too long
+            if len(feature_sequence) > self.max_len:
+                feature_sequence = feature_sequence[: self.max_len]
 
-            elif self.model_type == "gnn":
-                final_data = physical_dag_to_graph(
-                    dag, self.noise_profile, ...
-                )  # Pass configs
-                final_data.y = fidelity_label
+            # 2. Pad with zeros if too short
+            padding_needed = self.max_len - len(feature_sequence)
+            if padding_needed > 0:
+                zero_vector = [0.0] * self.feature_dim
+                feature_sequence.extend([zero_vector] * padding_needed)
 
-        # For GNN, the data and label are bundled. For consistency, we return both.
-        if self.model_type == "gnn":
-            return final_data, final_data.y
-        else:
+            final_data = torch.tensor(feature_sequence, dtype=torch.float32)
             return final_data, fidelity_label
 
-    def _dag_to_feature_sequence(self, physical_dag: DAGCircuit) -> list:
-        """
-        Helper method to generate the sequence of feature vectors for the Transformer.
-        This contains the logic from your old _physical_dag_to_feature_tensor.
-        """
-        gate_feature_sequence = []
-        for node in physical_dag.op_nodes():
-            # (This is the exact same feature extraction logic as in physical_dag_to_graph)
-            # --- Gate Type Encoding ---
-            gate_type_encoding = [0.0] * len(self.gate_vocab)
-            op_name = node.op.name
-            if op_name in self.gate_vocab:
-                gate_type_encoding[self.gate_vocab.index(op_name)] = 1.0
+        elif self.model_type == "gnn":
+            # --- Generate a graph Data object for the GNN ---
+
+            # Node features are just the sequence from the dataset
+            node_features = torch.tensor(feature_sequence, dtype=torch.float32)
+
+            # Create a simple sequential edge_index: 0->1, 1->2, 2->3, ...
+            num_nodes = node_features.shape[0]
+            if num_nodes > 1:
+                source_nodes = torch.arange(0, num_nodes - 1)
+                dest_nodes = torch.arange(1, num_nodes)
+                edge_index = torch.stack([source_nodes, dest_nodes], dim=0)
             else:
-                gate_type_encoding[len(self.gate_vocab) - 1] = 1.0
+                edge_index = torch.empty((2, 0), dtype=torch.long)
 
-            # --- Gate Parameter Extraction ---
-            gate_params = [0.0] * self.num_params
-            if hasattr(node.op, "params") and node.op.params:
-                gate_params[0] = float(node.op.params[0]) / (2 * math.pi)
-
-            # --- Noise Profile Feature Extraction ---
-            physical_indices = [
-                physical_dag.find_bit(q).index for q in node.qargs
-            ]
-            phys_q1_features = [0.0] * self.num_qubit_features
-            phys_q2_features = [0.0] * self.num_qubit_features
-            gate_cal_features = [0.0] * self.num_gate_cal_features
-            if physical_indices:
-                pq1 = physical_indices[0]
-                t1, t2 = self.noise_profile.get_t1_t2(pq1)
-                readout_err = self.noise_profile.get_readout_error(pq1)
-                phys_q1_features = [t1, t2, readout_err]
-                if len(physical_indices) == 2:
-                    pq2 = physical_indices[1]
-                    t1_2, t2_2 = self.noise_profile.get_t1_t2(pq2)
-                    readout_err_2 = self.noise_profile.get_readout_error(pq2)
-                    phys_q2_features = [t1_2, t2_2, readout_err_2]
-                    gate_err, gate_dur = (
-                        self.noise_profile.get_gate_properties(
-                            op_name, (pq1, pq2)
-                        )
-                    )
-                    gate_cal_features = [gate_err, gate_dur]
-                elif len(physical_indices) == 1:
-                    gate_err, gate_dur = (
-                        self.noise_profile.get_gate_properties(op_name, (pq1,))
-                    )
-                    gate_cal_features = [gate_err, gate_dur]
-
-            feature_vector = (
-                gate_type_encoding
-                + gate_params
-                + phys_q1_features
-                + phys_q2_features
-                + gate_cal_features
+            final_data = Data(
+                x=node_features, edge_index=edge_index, y=fidelity_label
             )
-            gate_feature_sequence.append(feature_vector)
-
-        return gate_feature_sequence
+            return final_data, fidelity_label
 
 
 # ==============================================================================
@@ -730,37 +736,36 @@ if __name__ == "__main__":
         "--model",
         type=str,
         default="transformer",
-        help="model transformer or gnn",
+        help="model transformer, gnn, cnn, fno",
     )
 
     args = parser.parse_args()
 
     # --- Setup ---
+    if args.model not in ["transformer", "gnn", "cnn", "fno"]:
+        raise ValueError(
+            "model_type must be either 'transformer' or 'gnn' or 'cnn' or 'fno'"
+        )
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"--- Using device: {device} ---")
 
     # --- Load Data ---
     print(f"Loading dataset from: {args.dataset_path}")
-    raw_data = load_and_deserialize_data(args.dataset_path)
-    # with open(args.dataset_path, "r") as f:
-    #     raw_data = json.load(f)
+    with open(args.dataset_path, "r") as f:
+        raw_data = json.load(f)
 
     # 2. Create the appropriate dataset instance
     #    The FidelityDataset is now smart enough to handle both cases.
     print(f"Preparing data for '{args.model}' model...")
     target = FakeWashingtonV2()
-    noise_profile = DeviceNoiseProfile(target)
-
-    GATE_VOCAB = ["cx", "sx", "rz", "x", "id", "measure", "other"]
+    noise_profile = DeviceNoiseProfile(get_target(target))
 
     full_dataset = FidelityDataset(
         raw_data=raw_data,
-        noise_profile=noise_profile,
         model_type=args.model,
         max_seq_len=args.max_seq_len,
         feature_dim=args.feature_dim,
-        gate_vocab=GATE_VOCAB,
     )
 
     # 3. Split the dataset into training and validation sets
@@ -825,6 +830,53 @@ if __name__ == "__main__":
             val_dataset, batch_size=args.batch_size, num_workers=4
         )
 
+    elif args.model == "cnn" or args.model == "fno":
+        print("Initializing CircuitCNN (1D-CNN) model...")
+        model = CircuitCNN(
+            feature_dim=args.feature_dim,
+            model_dim=args.model_dim,  # For a CNN, you can often use a smaller dim, e.g., 64
+            n_layers=args.n_layers,  # A few layers (e.g., 3-4) is usually enough
+            dropout=0.1,
+        ).to(device)
+
+        # Use the STANDARD PyTorch DataLoader, same as the Transformer
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            num_workers=4,
+            pin_memory=True,
+        )
+    elif args.model == "fno":
+        print("Initializing CircuitCNN (1D-CNN) model...")
+        model = CircuitFNO(
+            feature_dim=args.feature_dim,
+            model_dim=args.model_dim,  # For a CNN, you can often use a smaller dim, e.g., 64
+            n_layers=args.n_layers,  # A few layers (e.g., 3-4) is usually enough
+            dropout=0.1,
+        ).to(device)
+
+        # Use the STANDARD PyTorch DataLoader, same as the Transformer
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            num_workers=4,
+            pin_memory=True,
+        )
+
     else:
         raise ValueError(f"Unknown model type specified: {args.model}")
 
@@ -857,14 +909,21 @@ if __name__ == "__main__":
                 dtype=torch.float16,
                 enabled=(device.type == "cuda"),
             ):
-                if args.model == "transformer":
+                if (
+                    args.model == "transformer"
+                    or args.model == "cnn"
+                    or args.model == "fno"
+                ):
+                    # Transformer and CNN use the standard DataLoader and expect a tuple
                     features, labels = batch
                     features, labels = (
                         features.to(device, non_blocking=True),
                         labels.to(device, non_blocking=True),
                     )
                     outputs = model(features)
+
                 elif args.model == "gnn":
+                    # GNN uses the GeometricDataLoader and expects a single Batch object
                     batch_data = batch.to(device)
                     labels = batch_data.y
                     outputs = model(batch_data)
@@ -889,7 +948,11 @@ if __name__ == "__main__":
                     dtype=torch.float16,
                     enabled=(device.type == "cuda"),
                 ):
-                    if args.model == "transformer":
+                    if (
+                        args.model == "transformer"
+                        or args.model == "cnn"
+                        or args.model == "fno"
+                    ):
                         features, labels = batch
                         features, labels = (
                             features.to(device, non_blocking=True),

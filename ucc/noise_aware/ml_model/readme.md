@@ -164,14 +164,30 @@ python C:\Users\junli\ucc\ucc\noise_aware\ml_model\train_model.py ^
     --dataset-path C:\Users\junli\ucc\ucc\noise_aware\ml_model\10k_dataset.json ^
     --output-dir C:\Users\junli\ucc\ucc\noise_aware\ml_model\gnn_model/ ^
     --epochs 50 ^
-    --batch-size 64 ^
-    --learning-rate 0.0001 ^
+    --batch-size 128 ^
+    --learning-rate 0.001 ^
     --patience 7 ^
     --min-delta 0.000005 ^
     --feature-dim 16 ^
-    --model-dim 128 ^
+    --model-dim 32 ^
     --n-layers 4 ^
     --model gnn
 ```
 
 !python /kaggle/ucc/ucc/noise_aware/ml_model/train_model.py --dataset-path /kaggle/input/ai-router-passes-10k-dataset/10k_dataset.json --output-dir /kaggle/working/ --epochs 50 --batch-size 64 --learning-rate 0.0001 --patience 7 --min-delta 0.000005 --feature-dim 16 --model-dim 128 --n-layers 4 --model gnn
+
+## CNN
+```
+python C:\Users\junli\ucc\ucc\noise_aware\ml_model\train_model.py ^
+    --dataset-path C:\Users\junli\ucc\ucc\noise_aware\ml_model\10k_dataset.json ^
+    --output-dir C:\Users\junli\ucc\ucc\noise_aware\ml_model\gnn_model/ ^
+    --epochs 50 ^
+    --batch-size 128 ^
+    --learning-rate 0.001 ^
+    --patience 7 ^
+    --min-delta 0.000005 ^
+    --feature-dim 16 ^
+    --model-dim 64 ^
+    --n-layers 4 ^
+    --model fno
+```

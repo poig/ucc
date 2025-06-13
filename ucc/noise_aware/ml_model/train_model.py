@@ -857,8 +857,9 @@ if __name__ == "__main__":
         print("Initializing CircuitCNN (1D-CNN) model...")
         model = CircuitFNO(
             feature_dim=args.feature_dim,
-            model_dim=args.model_dim,  # For a CNN, you can often use a smaller dim, e.g., 64
-            n_layers=args.n_layers,  # A few layers (e.g., 3-4) is usually enough
+            n_modes=16,  # A small, efficient starting point
+            hidden_channels=64,  # A reasonable width
+            n_layers=4,  # 4 FNO blocks is a good default
             dropout=0.1,
         ).to(device)
 

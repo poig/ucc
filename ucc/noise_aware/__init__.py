@@ -12,10 +12,12 @@ compilation, aiming to improve circuit fidelity on real quantum hardware.
 from .noise_aware_pass import ResourcePruningPass, DeviceNoiseProfile
 from .ml_model.train_model import CircuitFormer
 from .ml_router import MLFidelityRouter
+from .backend_utils import get_target
 
 __all__ = [
     "ResourcePruningPass",
     "DeviceNoiseProfile",
     "CircuitFormer",
     "MLFidelityRouter",
+    "get_target",
 ]

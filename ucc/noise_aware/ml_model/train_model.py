@@ -4,11 +4,19 @@ import argparse
 import json
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
 import os
 import math
+from qiskit.dagcircuit import DAGCircuit
+from torch_geometric.data import Data
+from torch_geometric.nn import SAGEConv, global_mean_pool
+from ucc.noise_aware.noise_aware_pass import DeviceNoiseProfile
+from ucc.noise_aware.backend_utils import get_target
+from qiskit_ibm_runtime.fake_provider import FakeWashingtonV2
+from torch_geometric.loader import DataLoader as GeometricDataLoader
 
 # ==============================================================================
 # 1. MODEL ARCHITECTURE (Copied directly into this file)
@@ -107,6 +115,143 @@ class CircuitFormer(nn.Module):
         return prediction
 
 
+class CircuitGNN(nn.Module):
+    """
+    A Graph Neural Network (GraphSAGE) model to predict quantum circuit fidelity.
+    It operates directly on the graph representation of the circuit.
+    """
+
+    def __init__(
+        self,
+        feature_dim: int,  # Dimensionality of each node's features
+        model_dim: int,  # The hidden dimension of the GNN layers
+        n_layers: int,  # The number of GNN layers
+        dropout: float,
+    ):
+        """
+        Args:
+            feature_dim (int): The number of features for each node (gate) in the graph.
+            model_dim (int): The hidden dimensionality of the GraphSAGE layers.
+            n_layers (int): The number of stacked GraphSAGE layers.
+            dropout (float): The dropout rate.
+        """
+        super().__init__()
+        self.dropout = dropout
+
+        self.convs = nn.ModuleList()
+        # Input layer: maps raw features to the model's hidden dimension
+        self.convs.append(SAGEConv(feature_dim, model_dim))
+
+        # Hidden layers
+        for _ in range(n_layers - 1):
+            self.convs.append(SAGEConv(model_dim, model_dim))
+
+        # Classifier Head: takes the graph-level embedding and predicts a single value
+        self.classifier_head = nn.Sequential(
+            nn.Linear(model_dim, model_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(model_dim // 2, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, data: Data) -> torch.Tensor:
+        """
+        Args:
+            data: A PyTorch Geometric `Data` object containing:
+                  - x: Node features, shape [num_nodes, feature_dim]
+                  - edge_index: Graph connectivity, shape [2, num_edges]
+                  - batch: Batch vector, shape [num_nodes]
+        """
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+
+        # Apply the GraphSAGE layers
+        for i, conv in enumerate(self.convs):
+            x = conv(x, edge_index)
+            x = F.relu(x)
+            if i < len(self.convs) - 1:  # No dropout on the last layer
+                x = F.dropout(x, p=self.dropout, training=self.training)
+
+        # Global Pooling: Aggregate node features into a single graph-level feature vector
+        # We use mean pooling here.
+        graph_embedding = global_mean_pool(x, batch)
+
+        # Pass the graph embedding through the final classifier
+        prediction = self.classifier_head(graph_embedding)
+
+        return prediction.view(-1)  # Flatten the output
+
+
+def physical_dag_to_graph(
+    physical_dag: DAGCircuit,
+    noise_profile,
+    gate_vocab: list,
+    num_params: int,
+    num_qubit_features: int,
+    num_gate_cal_features: int,
+) -> Data:
+    """
+    Converts a physically-mapped Qiskit DAGCircuit into a PyTorch Geometric
+    Data object for use with a GNN.
+
+    Nodes represent gates, and edges represent dependencies (wires).
+    """
+    nodes = list(physical_dag.op_nodes())
+    node_map = {node: i for i, node in enumerate(nodes)}
+
+    node_features = []
+    edge_list = []
+
+    for i, node in enumerate(nodes):
+        # --- 1. Node Feature Extraction (same logic as before) ---
+        # (This is a simplified version of your previous feature extractor)
+        gate_type_encoding = [0.0] * len(gate_vocab)
+        op_name = node.op.name
+        if op_name in gate_vocab:
+            gate_type_encoding[gate_vocab.index(op_name)] = 1.0
+        else:
+            gate_type_encoding[-1] = 1.0
+
+        gate_params = [0.0] * num_params
+        # ... (add your parameter extraction logic) ...
+
+        [physical_dag.find_bit(q).index for q in node.qargs]
+        phys_q1_features, phys_q2_features, gate_cal_features = (
+            [0.0] * num_qubit_features,
+            [0.0] * num_qubit_features,
+            [0.0] * num_gate_cal_features,
+        )
+        # ... (add your noise profile feature extraction logic) ...
+
+        feature_vector = (
+            gate_type_encoding
+            + gate_params
+            + phys_q1_features
+            + phys_q2_features
+            + gate_cal_features
+        )
+        node_features.append(feature_vector)
+
+        # --- 2. Edge Index Creation ---
+        # Add edges from this node's predecessors to this node
+        for pred in physical_dag.predecessors(node):
+            if pred.type == "op":  # Only connect operation nodes
+                pred_idx = node_map[pred]
+                edge_list.append([pred_idx, i])
+
+    # Convert to PyTorch Tensors
+    x = torch.tensor(node_features, dtype=torch.float32)
+
+    # edge_index must be shape [2, num_edges] and LongTensor
+    if edge_list:
+        edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+    else:
+        # Handle case with no edges (e.g., a circuit with one gate)
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+
+    return Data(x=x, edge_index=edge_index)
+
+
 # ==============================================================================
 # 2. DATASET CLASS (Copied directly into this file)
 # ==============================================================================
@@ -114,43 +259,155 @@ class CircuitFormer(nn.Module):
 
 class FidelityDataset(Dataset):
     """
-    A PyTorch Dataset class that also handles padding and truncation.
+    A flexible PyTorch Dataset that can generate data for either a Transformer
+    or a Graph Neural Network model.
     """
 
-    def __init__(self, raw_data, max_seq_len: int, feature_dim: int):
-        self.data = raw_data
+    def __init__(
+        self,
+        raw_data,  # A list of dictionaries: [{'dag': dag_obj, 'fidelity': score}, ...]
+        noise_profile,  # The instantiated DeviceNoiseProfile object
+        model_type: str,  # Either "transformer" or "gnn"
+        # --- Transformer-specific arguments ---
+        max_seq_len: int = 1024,
+        # --- Common feature extraction arguments ---
+        feature_dim: int = 16,
+        gate_vocab: list = None,
+        num_params: int = 1,
+        num_qubit_features: int = 3,
+        num_gate_cal_features: int = 2,
+    ):
+        if model_type not in ["transformer", "gnn"]:
+            raise ValueError(
+                "model_type must be either 'transformer' or 'gnn'"
+            )
+
+        self.raw_data = raw_data
+        self.noise_profile = noise_profile
+        self.model_type = model_type
+
+        # Store all configuration parameters
         self.max_len = max_seq_len
         self.feature_dim = feature_dim
+        self.gate_vocab = gate_vocab or [
+            "cx",
+            "sx",
+            "rz",
+            "x",
+            "id",
+            "measure",
+            "other",
+        ]
+        self.num_params = num_params
+        self.num_qubit_features = num_qubit_features
+        self.num_gate_cal_features = num_gate_cal_features
 
     def __len__(self):
-        return len(self.data)
+        return len(self.raw_data)
 
     def __getitem__(self, idx):
-        item = self.data[idx]
-
-        # --- PADDING & TRUNCATION LOGIC ---
-        feature_sequence = item["feature_tensor"]
-
-        # 1. Truncate if too long
-        if len(feature_sequence) > self.max_len:
-            feature_sequence = feature_sequence[: self.max_len]
-
-        # 2. Pad with zeros if too short
-        padding_needed = self.max_len - len(feature_sequence)
-        if padding_needed > 0:
-            # Create a list of zero vectors for padding
-            zero_vector = [0.0] * self.feature_dim
-            padding = [zero_vector] * padding_needed
-            feature_sequence.extend(padding)
-
-        # Convert to tensor *after* ensuring correct size
-        feature_tensor = torch.tensor(feature_sequence, dtype=torch.float32)
-
+        # 1. Get the raw data point
+        item = self.raw_data[idx]
+        dag = item["dag"]  # The Qiskit DAGCircuit object
         fidelity_label = torch.tensor(
             [item["fidelity_label"]], dtype=torch.float32
         )
 
-        return feature_tensor, fidelity_label
+        # 2. Decide which feature extractor to use based on model_type
+        if self.model_type == "transformer":
+            # --- Generate padded tensor for the Transformer ---
+
+            # This logic is moved from your old feature extractor directly into the dataset
+            # It converts the DAG into a list of feature vectors first.
+            feature_sequence = self._dag_to_feature_sequence(dag)
+
+            # Then, it performs padding and truncation.
+            if len(feature_sequence) > self.max_len:
+                feature_sequence = feature_sequence[: self.max_len]
+
+            padding_needed = self.max_len - len(feature_sequence)
+            if padding_needed > 0:
+                zero_vector = [0.0] * self.feature_dim
+                feature_sequence.extend([zero_vector] * padding_needed)
+
+            # The final item is the feature tensor
+            final_data = torch.tensor(feature_sequence, dtype=torch.float32)
+
+        elif self.model_type == "gnn":
+            # --- Generate a graph Data object for the GNN ---
+            final_data = physical_dag_to_graph(
+                dag,
+                self.noise_profile,
+                gate_vocab=self.gate_vocab,
+                num_params=self.num_params,
+                num_qubit_features=self.num_qubit_features,
+                num_gate_cal_features=self.num_gate_cal_features,
+            )
+            # For GNNs, the label is usually stored as an attribute of the Data object
+            final_data.y = fidelity_label
+
+        return final_data, fidelity_label
+
+    def _dag_to_feature_sequence(self, physical_dag: DAGCircuit) -> list:
+        """
+        Helper method to generate the sequence of feature vectors for the Transformer.
+        This contains the logic from your old _physical_dag_to_feature_tensor.
+        """
+        gate_feature_sequence = []
+        for node in physical_dag.op_nodes():
+            # (This is the exact same feature extraction logic as in physical_dag_to_graph)
+            # --- Gate Type Encoding ---
+            gate_type_encoding = [0.0] * len(self.gate_vocab)
+            op_name = node.op.name
+            if op_name in self.gate_vocab:
+                gate_type_encoding[self.gate_vocab.index(op_name)] = 1.0
+            else:
+                gate_type_encoding[len(self.gate_vocab) - 1] = 1.0
+
+            # --- Gate Parameter Extraction ---
+            gate_params = [0.0] * self.num_params
+            if hasattr(node.op, "params") and node.op.params:
+                gate_params[0] = float(node.op.params[0]) / (2 * math.pi)
+
+            # --- Noise Profile Feature Extraction ---
+            physical_indices = [
+                physical_dag.find_bit(q).index for q in node.qargs
+            ]
+            phys_q1_features = [0.0] * self.num_qubit_features
+            phys_q2_features = [0.0] * self.num_qubit_features
+            gate_cal_features = [0.0] * self.num_gate_cal_features
+            if physical_indices:
+                pq1 = physical_indices[0]
+                t1, t2 = self.noise_profile.get_t1_t2(pq1)
+                readout_err = self.noise_profile.get_readout_error(pq1)
+                phys_q1_features = [t1, t2, readout_err]
+                if len(physical_indices) == 2:
+                    pq2 = physical_indices[1]
+                    t1_2, t2_2 = self.noise_profile.get_t1_t2(pq2)
+                    readout_err_2 = self.noise_profile.get_readout_error(pq2)
+                    phys_q2_features = [t1_2, t2_2, readout_err_2]
+                    gate_err, gate_dur = (
+                        self.noise_profile.get_gate_properties(
+                            op_name, (pq1, pq2)
+                        )
+                    )
+                    gate_cal_features = [gate_err, gate_dur]
+                elif len(physical_indices) == 1:
+                    gate_err, gate_dur = (
+                        self.noise_profile.get_gate_properties(op_name, (pq1,))
+                    )
+                    gate_cal_features = [gate_err, gate_dur]
+
+            feature_vector = (
+                gate_type_encoding
+                + gate_params
+                + phys_q1_features
+                + phys_q2_features
+                + gate_cal_features
+            )
+            gate_feature_sequence.append(feature_vector)
+
+        return gate_feature_sequence
 
 
 # ==============================================================================
@@ -238,6 +495,12 @@ if __name__ == "__main__":
         default=512,
         help="Max sequence length for model and data.",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="transformer",
+        help="model transformer or gnn",
+    )
 
     args = parser.parse_args()
 
@@ -251,38 +514,87 @@ if __name__ == "__main__":
     with open(args.dataset_path, "r") as f:
         raw_data = json.load(f)
 
+    # 1. Select the model type from arguments
+    model_type = "transformer" if args.model == "transformer" else "gnn"
+
+    # 2. Create the appropriate dataset instance
+    #    The FidelityDataset is now smart enough to handle both cases.
+    print(f"Preparing data for '{model_type}' model...")
+    target = FakeWashingtonV2()
+    noise_profile = DeviceNoiseProfile(get_target(target))
     full_dataset = FidelityDataset(
-        raw_data, max_seq_len=args.max_seq_len, feature_dim=args.feature_dim
+        raw_data=raw_data,
+        noise_profile=noise_profile,
+        model_type=model_type,
+        max_seq_len=args.max_seq_len,
+        feature_dim=args.feature_dim,
+        # You can pass other feature config args here if needed
     )
+
+    # 3. Split the dataset into training and validation sets
+    #    This part remains the same, as random_split works on any Dataset object.
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
     train_dataset, val_dataset = random_split(
         full_dataset, [train_size, val_size]
     )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True
-    )
     print(
         f"Loaded {len(raw_data)} samples. Training on {len(train_dataset)}, validating on {len(val_dataset)}."
     )
 
-    # --- Initialize Model and Optimizer ---
-    model = CircuitFormer(
-        feature_dim=args.feature_dim,
-        model_dim=args.model_dim,
-        n_heads=args.n_heads,
-        n_layers=args.n_layers,
-        dropout=0.1,
-        max_seq_len=args.max_seq_len,
-    ).to(device)
+    # 4. Initialize the correct model AND the correct DataLoader
+    if args.model == "transformer":
+        print("Initializing CircuitFormer (Transformer) model...")
+        model = CircuitFormer(
+            feature_dim=args.feature_dim,
+            model_dim=args.model_dim,
+            n_heads=args.n_heads,
+            n_layers=args.n_layers,
+            dropout=0.1,
+            max_seq_len=args.max_seq_len,
+        ).to(device)
+
+        # Use the standard PyTorch DataLoader for the Transformer
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            num_workers=4,
+            pin_memory=True,
+        )
+
+    elif (
+        args.model == "gnn"
+    ):  # Use "gnn", not "graphNN" to match your dataset's model_type
+        print("Initializing CircuitGNN (Graph Neural Network) model...")
+        model = CircuitGNN(
+            feature_dim=args.feature_dim,
+            model_dim=args.model_dim,
+            n_layers=args.n_layers,
+            dropout=0.1,
+        ).to(device)
+
+        # --- IMPORTANT: Use the DataLoader from PyTorch Geometric ---
+        train_loader = GeometricDataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=4,
+            # pin_memory is not typically used with PyG loaders
+        )
+        val_loader = GeometricDataLoader(
+            val_dataset, batch_size=args.batch_size, num_workers=4
+        )
+
+    else:
+        raise ValueError(f"Unknown model type specified: {args.model}")
 
     criterion = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)

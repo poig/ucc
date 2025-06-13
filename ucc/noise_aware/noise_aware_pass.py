@@ -19,6 +19,7 @@ class DeviceNoiseProfile:
         self.coupling_map = self.target.build_coupling_map()
         self.cnot_errors = {}
         self.swap_costs = {}
+        self.gate_errors = {}
         self.readout_errors = {}
         self._build_noise_model()
 
@@ -38,7 +39,6 @@ class DeviceNoiseProfile:
         if not self.coupling_map:
             return
 
-        # --- THE DEFINITIVE FIX IS HERE ---
         # Iterate through the qubits and get the error of the 'measure' op on each
         for q_idx in range(self.target.num_qubits):
             # Qubits for single-qubit ops are specified as a tuple, e.g., (0,)
@@ -81,7 +81,6 @@ class DeviceNoiseProfile:
         else:
             avg_readout_error = np.mean(readout_errors_list)
 
-        # --- THE FIX IS HERE ---
         # Explicitly cast each numpy float to a standard Python float.
         # This makes the list JSON serializable.
         return [
@@ -126,6 +125,40 @@ class DeviceNoiseProfile:
         except (KeyError, AttributeError):
             # Return a very poor default value if gate/qubits not supported
             return (1.0, 0.0)
+
+    def get_gate_error(self, gate_name: str, physical_qubits: tuple) -> float:
+        """
+        Gets the error for any gate on a specific set of physical qubits.
+        Handles looking up the correct key format.
+        """
+        # Ensure qubits are sorted for consistent dictionary key lookup
+        qubits_key = tuple(sorted(physical_qubits))
+
+        # --- Look for the specific gate and qubit combination ---
+        error = self.gate_errors.get((gate_name, qubits_key))
+
+        if error is not None:
+            return error
+
+        # --- Fallback Logic (Optional but Recommended) ---
+        # If a specific gate (e.g., 'cx' from a user) isn't found, but the native
+        # gate (e.g., 'ecr') exists for those qubits, use the native gate's error.
+        # This handles cases where a circuit hasn't been fully translated yet.
+        if len(qubits_key) == 2:
+            native_2q_gate_name = next(
+                (
+                    name
+                    for name, props in self.gate_errors.items()
+                    if name[1] == qubits_key
+                ),
+                None,
+            )
+            if native_2q_gate_name:
+                return self.gate_errors[native_2q_gate_name]
+
+        # Return a sensible default if no error data is found at all.
+        # A small non-zero value is better than zero.
+        return 0.001
 
 
 class ResourcePruningPass(TransformationPass):

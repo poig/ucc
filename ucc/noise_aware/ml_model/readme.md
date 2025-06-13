@@ -33,11 +33,11 @@ python ucc\noise_aware\ml_model\train_model.py --dataset-path diverse_fidelity_d
 ## My attempt with 8gb intel i8 rtx1050
 ```
 python ucc/noise_aware/ml_model/generate_dataset.py ^
-    --num-samples 10_000 ^
+    --num-samples 3000 ^
     --max-qubits 100 ^
     --min-qubits 4 ^
     --output-file C:/Users/junli/ucc/ucc/noise_aware/ml_model/diverse_fidelity_dataset.json ^
-    --max-seq-len 2048
+    --max-seq-len 512
 ```
 Dataset Composition:
 - EfficientSU2: 1211 samples (24.2%)
@@ -55,10 +55,10 @@ python ucc/noise_aware/ml_model/train_model.py ^
     --learning-rate 0.0001 ^
     --patience 5 ^
     --min-delta 0.00001 ^
-    --model-dim 256 ^
+    --model-dim 64 ^
     --n-heads 8 ^
-    --n-layers 6 ^
-    --max-seq-len 512
+    --n-layers 4 ^
+    --max-seq-len 256
 ```
 
 ## google/kaggle collab
@@ -156,4 +156,20 @@ Best model saved to: /kaggle/model/best_model.pth
 run ucc-bench layout benchmarking
 ```
 uv run ucc-bench C:\Users\junli\ucc-bench\benchmarks\layout_benchmarks.toml
+```
+
+## GNN
+```
+python C:\Users\junli\ucc\ucc\noise_aware\ml_model\train_model.py ^
+    --dataset-path C:\Users\junli\ucc\ucc\noise_aware\ml_model\10k_dataset.json ^
+    --output-dir C:\Users\junli\ucc\ucc\noise_aware\ml_model\gnn_model/ ^
+    --epochs 50 ^
+    --batch-size 64 ^
+    --learning-rate 0.0001 ^
+    --patience 7 ^
+    --min-delta 0.000005 ^
+    --feature-dim 16 ^
+    --model-dim 128 ^
+    --n-layers 4 ^
+    --model gnn
 ```

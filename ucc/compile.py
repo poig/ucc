@@ -89,11 +89,11 @@ def compile(
         # This is crucial for the weights to load correctly.
         model_params = {
             "feature_dim": 16,
-            "model_dim": 256,
+            "model_dim": 64,
             "n_heads": 8,
-            "n_layers": 8,
+            "n_layers": 4,
             "dropout": 0.1,
-            "max_seq_len": 1024,
+            "max_seq_len": 256,
         }
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -101,7 +101,7 @@ def compile(
         trained_model = CircuitFormer(**model_params).to(device)
 
         # Load the saved weights from your best model
-        model_path = "C:/Users/junli/ucc/ucc/noise_aware/ml_model/trained_models_medium_reliable/best_model.pth"
+        model_path = "C:/Users/junli/ucc/ucc/noise_aware/ml_model/trained_models_final/best_model.pth"
         trained_model.load_state_dict(
             torch.load(model_path, map_location=device)
         )
@@ -110,13 +110,13 @@ def compile(
         # 2. Construct the list of passes for our pre-compilation
         pre_pass_list = [
             # Stage 1: Find a good initial layout.
-            SabreLayout(coupling_map, skip_routing=True),
+            SabreLayout(coupling_map, skip_routing=True, seed=42),
             # Stage 2: Our custom, noise-aware routing pass.
             MLFidelityRouter(
                 target=target,
                 model=trained_model,
                 noise_profile=noise_profile,
-                max_seq_len=256,
+                max_seq_len=model_params["max_seq_len"],
             ),
             BasisTranslator(
                 StandardEquivalenceLibrary, list(target.operation_names)
@@ -127,6 +127,7 @@ def compile(
         qiskit_circuit = pm_pre.run(qiskit_circuit)
         # Our pass manager has now modified the circuit and the property_set
         property_set = pm_pre.property_set
+        return qiskit_circuit, property_set["layout"]
 
     run_default_mapping = not noise_aware_routing
     ucc_default1 = UCCDefault1(
@@ -153,4 +154,4 @@ def compile(
         )
     # Translate the compiled circuit to the desired format
     final_result = translate(compiled_circuit, return_format)
-    return final_result
+    return final_result, property_set

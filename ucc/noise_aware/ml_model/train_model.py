@@ -13,8 +13,8 @@ import math
 from qiskit.dagcircuit import DAGCircuit
 from torch_geometric.data import Data
 from torch_geometric.nn import SAGEConv, global_mean_pool
-from ..noise_aware_pass import DeviceNoiseProfile
-from ..backend_utils import get_target
+from ucc.noise_aware.noise_aware_pass import DeviceNoiseProfile
+from ucc.noise_aware.backend_utils import get_target
 from qiskit_ibm_runtime.fake_provider import FakeWashingtonV2
 from torch_geometric.loader import DataLoader as GeometricDataLoader
 

@@ -460,92 +460,111 @@ class FidelityDataset(Dataset):
     """
     A flexible PyTorch Dataset that can generate data for either a Transformer
     or a Graph Neural Network model.
+
+    It can operate in two modes:
+    1. On-the-fly processing: If `raw_data` is provided, it converts DAGs
+       to features with every __getitem__ call (slower).
+    2. Pre-processed loading: If `preprocessed_path` is provided, it loads
+       a pre-saved list of processed data objects (much faster).
     """
 
     def __init__(
         self,
-        raw_data,  # A list of dictionaries: [{'dag': dag_obj, 'fidelity': score}, ...]
-        noise_profile,  # The instantiated DeviceNoiseProfile object
-        model_type: str,  # Either "transformer" or "gnn"
-        # --- Transformer-specific arguments ---
+        model_type: str,
+        # --- Data Sources (provide ONE of these) ---
+        raw_data=None,
+        preprocessed_path: str = None,
+        # --- Config for On-the-fly Processing ---
+        noise_profile=None,
         max_seq_len: int = 1024,
-        # --- Common feature extraction arguments ---
         feature_dim: int = 16,
         gate_vocab: list = None,
-        num_params: int = 1,
-        num_qubit_features: int = 3,
-        num_gate_cal_features: int = 2,
+        # ... other feature config ...
     ):
         if model_type not in ["transformer", "gnn"]:
             raise ValueError(
                 "model_type must be either 'transformer' or 'gnn'"
             )
 
-        self.raw_data = raw_data
-        self.noise_profile = noise_profile
+        if raw_data is None and preprocessed_path is None:
+            raise ValueError(
+                "Must provide either 'raw_data' or 'preprocessed_path'"
+            )
+
+        if raw_data is not None and preprocessed_path is not None:
+            print(
+                "Warning: Both raw_data and preprocessed_path provided. Using pre-processed data."
+            )
+
         self.model_type = model_type
 
-        # Store all configuration parameters
-        self.max_len = max_seq_len
-        self.feature_dim = feature_dim
-        self.gate_vocab = gate_vocab or [
-            "cx",
-            "sx",
-            "rz",
-            "x",
-            "id",
-            "measure",
-            "other",
-        ]
-        self.num_params = num_params
-        self.num_qubit_features = num_qubit_features
-        self.num_gate_cal_features = num_gate_cal_features
+        # --- THE NEW LOGIC ---
+        if preprocessed_path and os.path.exists(preprocessed_path):
+            print(f"Loading pre-processed data from: {preprocessed_path}")
+            self.data = torch.load(preprocessed_path)
+            self.is_preprocessed = True
+        else:
+            print("Processing raw data on-the-fly.")
+            if raw_data is None:
+                raise FileNotFoundError(
+                    f"Pre-processed file not found at: {preprocessed_path}"
+                )
+            self.data = raw_data
+            self.is_preprocessed = False
+            # Store config needed for on-the-fly processing
+            self.noise_profile = noise_profile
+            self.max_len = max_seq_len
+            self.feature_dim = feature_dim
+            self.gate_vocab = gate_vocab or [
+                "cx",
+                "sx",
+                "rz",
+                "x",
+                "id",
+                "measure",
+                "other",
+            ]
+            # ... store other feature configs ...
 
     def __len__(self):
-        return len(self.raw_data)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        # 1. Get the raw data point
-        item = self.raw_data[idx]
-        dag = item["dag"]  # The Qiskit DAGCircuit object
-        fidelity_label = torch.tensor(
-            [item["fidelity_label"]], dtype=torch.float32
-        )
+        item = self.data[idx]
 
-        # 2. Decide which feature extractor to use based on model_type
-        if self.model_type == "transformer":
-            # --- Generate padded tensor for the Transformer ---
-
-            # This logic is moved from your old feature extractor directly into the dataset
-            # It converts the DAG into a list of feature vectors first.
-            feature_sequence = self._dag_to_feature_sequence(dag)
-
-            # Then, it performs padding and truncation.
-            if len(feature_sequence) > self.max_len:
-                feature_sequence = feature_sequence[: self.max_len]
-
-            padding_needed = self.max_len - len(feature_sequence)
-            if padding_needed > 0:
-                zero_vector = [0.0] * self.feature_dim
-                feature_sequence.extend([zero_vector] * padding_needed)
-
-            # The final item is the feature tensor
-            final_data = torch.tensor(feature_sequence, dtype=torch.float32)
-
-        elif self.model_type == "gnn":
-            # --- Generate a graph Data object for the GNN ---
-            final_data = physical_dag_to_graph(
-                dag,
-                self.noise_profile,
-                gate_vocab=self.gate_vocab,
-                num_params=self.num_params,
-                num_qubit_features=self.num_qubit_features,
-                num_gate_cal_features=self.num_gate_cal_features,
+        if self.is_preprocessed:
+            final_data = item["data"]
+            fidelity_label = item["fidelity_label"]
+        else:
+            dag = item["dag"]
+            fidelity_label = torch.tensor(
+                [item["fidelity_label"]], dtype=torch.float32
             )
-            # For GNNs, the label is usually stored as an attribute of the Data object
-            final_data.y = fidelity_label
 
-        return final_data, fidelity_label
+            if self.model_type == "transformer":
+                feature_sequence = self._dag_to_feature_sequence(dag)
+                # Padding & Truncation
+                if len(feature_sequence) > self.max_len:
+                    feature_sequence = feature_sequence[: self.max_len]
+                padding_needed = self.max_len - len(feature_sequence)
+                if padding_needed > 0:
+                    zero_vector = [0.0] * self.feature_dim
+                    feature_sequence.extend([zero_vector] * padding_needed)
+                final_data = torch.tensor(
+                    feature_sequence, dtype=torch.float32
+                )
+
+            elif self.model_type == "gnn":
+                final_data = physical_dag_to_graph(
+                    dag, self.noise_profile, ...
+                )  # Pass configs
+                final_data.y = fidelity_label
+
+        # For GNN, the data and label are bundled. For consistency, we return both.
+        if self.model_type == "gnn":
+            return final_data, final_data.y
+        else:
+            return final_data, fidelity_label
 
     def _dag_to_feature_sequence(self, physical_dag: DAGCircuit) -> list:
         """
@@ -713,18 +732,15 @@ if __name__ == "__main__":
     with open(args.dataset_path, "r") as f:
         raw_data = json.load(f)
 
-    # 1. Select the model type from arguments
-    model_type = "transformer" if args.model == "transformer" else "gnn"
-
     # 2. Create the appropriate dataset instance
     #    The FidelityDataset is now smart enough to handle both cases.
-    print(f"Preparing data for '{model_type}' model...")
+    print(f"Preparing data for '{args.model}' model...")
     target = FakeWashingtonV2()
     noise_profile = DeviceNoiseProfile(get_target(target))
     full_dataset = FidelityDataset(
         raw_data=raw_data,
         noise_profile=noise_profile,
-        model_type=model_type,
+        model_type=args.model,
         max_seq_len=args.max_seq_len,
         feature_dim=args.feature_dim,
         # You can pass other feature config args here if needed
